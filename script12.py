@@ -1,6 +1,6 @@
-from aiohttp import web
 import os
 import asyncio
+import time  # Добавлено для защиты от спама
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
@@ -9,23 +9,20 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
 
 # --- НАСТРОЙКИ ---
-# Токен вашего бота (получить у @BotFather)
 BOT_TOKEN = "8868862012:AAEdg_2eC1QUo32cp9kgmiS2mEmoWDkHPmA"
-# ID администратора или ID чата, куда будут приходить анкеты
 ADMIN_CHAT_ID = -5532275291
 # ------------------
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# Хранилище для защиты от быстрого повторного нажатия/отправки (анти-спам)
+LAST_MESSAGE_TIME = {}
 
-# Состояния для опроса
 class Form(StatesGroup):
     role = State()
     current_question = State()
 
-
-# Данные, требования и вопросы
 DATA = {
     "streamer": {
         "title": "🎥 Стример",
@@ -109,9 +106,6 @@ DATA = {
     }
 }
 
-
-# --- КЛАВИАТУРЫ ---
-
 def get_main_keyboard():
     buttons = [
         [InlineKeyboardButton(text="🎥 Подать на Стримера", callback_data="apply_streamer")],
@@ -120,9 +114,7 @@ def get_main_keyboard():
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
 def get_admin_keyboard(user_id: int):
-    # Кнопки для админ-чата, передающие ID кандидата
     buttons = [
         [
             InlineKeyboardButton(text="✅ Одобрить", callback_data=f"adm_accept_{user_id}"),
@@ -131,8 +123,6 @@ def get_admin_keyboard(user_id: int):
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
-# --- ХЕНДЛЕРЫ КЛИЕНТСКОЙ ЧАСТИ ---
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
@@ -144,16 +134,13 @@ async def cmd_start(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-
 @dp.callback_query(F.data.startswith("apply_"))
 async def process_apply(callback: CallbackQuery, state: FSMContext):
     role = callback.data.split("_")[1]
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Я подхожу, начать", callback_data=f"start_survey_{role}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
     ])
-
     await callback.message.edit_text(
         f"{DATA[role]['requirements']}\n\n"
         "✨ *Пожалуйста, внимательно ознакомься с требованиями. Если ты подходишь — нажимай кнопку ниже!*",
@@ -162,19 +149,16 @@ async def process_apply(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-
 @dp.callback_query(F.data == "cancel")
 async def process_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("✨ Подача анкеты отменена. Ты можешь начать заново в любое время: /start")
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("start_survey_"))
 async def start_survey(callback: CallbackQuery, state: FSMContext):
     role = callback.data.split("_")[2]
     await state.update_data(role=role, answers=[], current_q_index=0)
-
     first_question = DATA[role]['questions'][0]
     await callback.message.edit_text(
         f"📝 **Вопрос 1 из {len(DATA[role]['questions'])}**\n\n*{first_question}*",
@@ -186,35 +170,45 @@ async def start_survey(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.current_question)
 async def process_question(message: Message, state: FSMContext):
-    # Ограничение: защита от отправки медиафайлов вместо текста
+    user_id = message.from_user.id
+    current_time = time.time()
+
+    # --- ЗАЩИТА ОТ СПАМА / ДАБЛ-КЛИКОВ ---
+    if user_id in LAST_MESSAGE_TIME and (current_time - LAST_MESSAGE_TIME[user_id]) < 1.0:
+        return  # Просто игнорируем слишком быстрые дубли сообщений
+
+    LAST_MESSAGE_TIME[user_id] = current_time
+
+    # --- ЖЕСТКАЯ ПРОВЕРКА НА ПЕРЕСЫЛКУ И ОТВЕТЫ (REPLY) ---
+    if message.forward_date or message.reply_to_message:
+        await message.answer("⚠️ Пожалуйста, пишите ответ самостоятельно в поле ввода, не используйте цитирование или пересылку сообщений.")
+        return
+
     if not message.text:
         await message.answer("⚠️ Пожалуйста, введи ответ текстом (без картинок, стикеров и файлов).")
         return
 
-    # Ограничение: защита от спама слишком длинными сообщениями (макс. 400 символов)
     if len(message.text) > 400:
         await message.answer("⚠️ Твой ответ слишком длинный (максимум 400 символов). Пожалуйста, напиши короче.")
         return
 
     user_data = await state.get_data()
-    role = user_data['role']
-    q_index = user_data['current_q_index']
-    answers = user_data['answers']
+    role = user_data.get('role')
+    q_index = user_data.get('current_q_index')
+    answers = user_data.get('answers', [])
 
-    # --- ПРОВЕРКА ВОЗРАСТА (Второй вопрос во всех анкетах, индекс = 1) ---
+    if role is None or q_index is None:
+        await state.clear()
+        return
+
+    # --- ПРОВЕРКА ВОЗРАСТА ---
     if q_index == 1:
         age_text = message.text.strip()
-
-        # Проверка, что введены исключительно цифры
         if not age_text.isdigit():
-            await message.answer(
-                "⚠️ Ошибка! В поле 'Возраст' нужно ввести **только цифры** (например: 14). Попробуй еще раз:")
+            await message.answer("⚠️ Ошибка! В поле 'Возраст' нужно ввести **только цифры** (например: 14). Попробуй еще раз:")
             return
-
         age = int(age_text)
-        min_age = 13 if role == "moderator" else 12  # Для модераторов 13+, для остальных 12+
-
-        # Жесткий отсев по возрасту без отправки анкеты админам
+        min_age = 13 if role == "moderator" else 12
         if age < min_age:
             await message.answer(
                 f"❌ **Подача заявки отклонена.**\n"
@@ -223,13 +217,10 @@ async def process_question(message: Message, state: FSMContext):
             )
             await state.clear()
             return
-    # ---------------------------------------------------------------------
 
     current_question_text = DATA[role]['questions'][q_index]
-    # Экранируем спецсимволы Markdown, чтобы ответы пользователей не ломали верстку в админке
     clean_text = message.text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
     answers.append((current_question_text, clean_text))
-
     next_q_index = q_index + 1
 
     if next_q_index < len(DATA[role]['questions']):
@@ -240,12 +231,9 @@ async def process_question(message: Message, state: FSMContext):
             parse_mode="Markdown"
         )
     else:
-        # Анкета успешно заполнена
         username = f"@{message.from_user.username}" if message.from_user.username else "Нет юзернейма"
-        user_id = message.from_user.id
         full_name = message.from_user.full_name.replace("_", "\\_").replace("*", "\\*")
 
-        # Красивый уютный шаблон для админ-группы
         summary = f"⚡️ **НОВАЯ ЗАЯВКА НА РАССМОТРЕНИЕ!**\n"
         summary += f"━━━━━━━━━━━━━━━━━━━━\n"
         summary += f"• **Должность:** {DATA[role]['title']}\n"
@@ -258,7 +246,6 @@ async def process_question(message: Message, state: FSMContext):
             summary += f"\n❓ *{q}*\n💬 {a}\n"
 
         try:
-            # Отправляем в чат администрации с интерактивными кнопками вердикта
             await bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=summary,
@@ -270,21 +257,17 @@ async def process_question(message: Message, state: FSMContext):
                 "Она будет рассмотрена в ближайшее время. В случае одобрения бот напишет вам сюда. Удачи! ✨"
             )
         except Exception as e:
-            await message.answer(
-                "❌ Произошла ошибка при отправке анкеты админу. Пожалуйста, обратитесь к создателю бота.")
+            await message.answer("❌ Произошла ошибка при отправке анкеты админу. Пожалуйста, обратитесь к создателю бота.")
             print(f"Ошибка отправки заявки: {e}")
 
         await state.clear()
 
-
-# --- ОБРАБОТКА РЕШЕНИЙ АДМИНИСТРАЦИИ ---
 
 @dp.callback_query(F.data.startswith("adm_accept_"))
 async def admin_accept(callback: CallbackQuery):
     target_user_id = int(callback.data.split("_")[2])
     admin_name = callback.from_user.full_name
 
-    # Отправляем уведомление кандидату в ЛС
     try:
         await bot.send_message(
             chat_id=target_user_id,
@@ -295,13 +278,11 @@ async def admin_accept(callback: CallbackQuery):
     except TelegramBadRequest:
         user_notified = "❌ Не удалось уведомить (бот заблокирован)"
 
-    # Обновляем сообщение в группе (убираем кнопки и пишем вердикт)
     updated_text = callback.message.text + f"\n\n🟢 **РЕШЕНИЕ:** Одобрен\n• **Администратор:** {admin_name}\n• ({user_notified})"
     try:
         await callback.message.edit_text(text=updated_text, reply_markup=None)
     except Exception as e:
         print(f"Ошибка обновления сообщения: {e}")
-
     await callback.answer("Кандидат одобрен!")
 
 
@@ -310,52 +291,27 @@ async def admin_decline(callback: CallbackQuery):
     target_user_id = int(callback.data.split("_")[2])
     admin_name = callback.from_user.full_name
 
-    # Отправляем уведомление кандидату в ЛС
     try:
         await bot.send_message(
             chat_id=target_user_id,
-            text="😔 **К сожалению, твоя заявка была отклонена.**\n"
+            text="😔 К сожалению, твоя заявка была отклонена.\n"
                  "Не расстраивайся! Ты можешь подтянуть свои навыки, набрать больше часов на сервере и попробовать подать заявку позже."
         )
         user_notified = "Уведомление отправлено"
     except TelegramBadRequest:
         user_notified = "❌ Не удалось уведомить (бот заблокирован)"
 
-    # Обновляем сообщение в группе (убираем кнопки и пишем вердикт)
     updated_text = callback.message.text + f"\n\n🔴 **РЕШЕНИЕ:** Отклонен\n• **Администратор:** {admin_name}\n• ({user_notified})"
     try:
         await callback.message.edit_text(text=updated_text, reply_markup=None)
     except Exception as e:
         print(f"Ошибка обновления сообщения: {e}")
-
     await callback.answer("Кандидат отклонен.")
 
 
-# --- ЗАПУСК БОТА ---
-
-# --- ДОБАВЛЯЕМ ЭТИ ДВЕ ФУНКЦИИ ДЛЯ РАБОТЫ НА RENDER ---
-async def handle(request):
-    return web.Response(text="Бот работает!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-
-# --- ТВОЯ ФУНКЦИЯ MAIN (ДОБАВЛЯЕМ В НЕЁ ОДНУ СТРОКУ) ---
 async def main():
-    # ... тут остается весь твой прежний код (создание bot, dp и т.д.) ...
-    
-    # Перед самым стартом поллинга вызываем запуск веб-сервера:
-    await start_web_server()
-    
     print("Бот успешно запущен и готов к работе!")
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
