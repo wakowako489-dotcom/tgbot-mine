@@ -1,3 +1,4 @@
+from aiohttp import web
 import os
 import asyncio
 from aiogram import Bot, Dispatcher, F
@@ -332,10 +333,29 @@ async def admin_decline(callback: CallbackQuery):
 
 # --- ЗАПУСК БОТА ---
 
+# --- ДОБАВЛЯЕМ ЭТИ ДВЕ ФУНКЦИИ ДЛЯ РАБОТЫ НА RENDER ---
+async def handle(request):
+    return web.Response(text="Бот работает!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+
+# --- ТВОЯ ФУНКЦИЯ MAIN (ДОБАВЛЯЕМ В НЕЁ ОДНУ СТРОКУ) ---
 async def main():
+    # ... тут остается весь твой прежний код (создание bot, dp и т.д.) ...
+    
+    # Перед самым стартом поллинга вызываем запуск веб-сервера:
+    await start_web_server()
+    
     print("Бот успешно запущен и готов к работе!")
     await dp.start_polling(bot)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
